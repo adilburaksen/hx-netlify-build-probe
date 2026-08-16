@@ -1,51 +1,50 @@
 #!/usr/bin/env bash
-# Read-only reconnaissance of the Netlify build sandbox.
-# The program invites exactly this: privilege escalation to root, secrets not already accessible to
-# this user, container escape, and orchestration control-plane access. Nothing here writes, deletes,
-# or sends data anywhere; every line only reports what this container can already see.
+# Second pass, narrowly scoped. The first pass showed a microVM with an unprivileged user and no
+# capabilities, so this one only follows the two threads it left open: the host node the build is
+# scheduled on, and the world-readable kernel log. Connect-only checks against a handful of named
+# ports; no scanning, nothing sent, nothing written.
 say(){ printf '\n===== %s =====\n' "$1"; }
 
-say "identity"
-id 2>&1; echo "whoami=$(whoami 2>&1)"; echo "uid=$(id -u 2>&1)"
+say "orchestration-adjacent values from our own build environment"
+echo "HOST_NODE_IP=${HOST_NODE_IP:-unset}"
+echo "ACCOUNT_ID=${ACCOUNT_ID:-unset}"
+echo "SITE_ID=${SITE_ID:-unset}"
+echo "BUILD_ID=${BUILD_ID:-unset}"
+echo "NETLIFY_BUILD_BASE=${NETLIFY_BUILD_BASE:-unset}"
+echo "skew token length=${#NETLIFY_SKEW_PROTECTION_TOKEN} prefix=${NETLIFY_SKEW_PROTECTION_TOKEN:0:6}"
+echo "FEATURE_FLAGS length=${#FEATURE_FLAGS}"
 
-say "kernel and container runtime"
-uname -a 2>&1
-cat /proc/1/cgroup 2>&1 | head -12
-cat /proc/self/status 2>&1 | grep -Ei 'CapEff|CapPrm|Seccomp|NoNewPrivs' || true
-echo "--- /.dockerenv:"; ls -la /.dockerenv 2>&1 || echo none
+say "can this build reach its own host node?"
+if [ -n "$HOST_NODE_IP" ]; then
+  for port in 10250 10255 4646 2375 2376 8500 22 443 80; do
+    timeout 2 bash -c "echo > /dev/tcp/$HOST_NODE_IP/$port" 2>/dev/null \
+      && echo "   OPEN   $HOST_NODE_IP:$port" || echo "   closed $HOST_NODE_IP:$port"
+  done
+else
+  echo "   HOST_NODE_IP unset"
+fi
 
-say "privileged devices and sockets"
-ls -la /var/run/docker.sock /run/docker.sock 2>&1 || echo "no docker socket"
-ls -la /dev/kmsg /dev/mem /dev/sd* /dev/nvme* 2>&1 | head -8 || echo "no raw devices"
-
-say "kubernetes service account"
-ls -la /var/run/secrets/kubernetes.io/serviceaccount/ 2>&1 || echo "no k8s serviceaccount mount"
-env | grep -i kubernetes 2>&1 || echo "no KUBERNETES_* env"
-
-say "mounts"
-mount 2>&1 | head -25
-
-say "cloud metadata reachability (read-only, no credential use)"
-for u in "http://169.254.169.254/latest/meta-data/" \
-         "http://169.254.169.254/computeMetadata/v1/?recursive=false" \
-         "http://metadata.google.internal/computeMetadata/v1/?recursive=false"; do
-  echo "--- $u"
-  curl -s -m 4 -o /dev/null -w '   http=%{http_code} time=%{time_total}\n' "$u" 2>&1 || echo "   unreachable"
+say "the internal resolver"
+cat /etc/resolv.conf 2>&1 | head -4
+for port in 53 80 443; do
+  timeout 2 bash -c "echo > /dev/tcp/172.16.6.1/$port" 2>/dev/null \
+    && echo "   OPEN   172.16.6.1:$port" || echo "   closed 172.16.6.1:$port"
 done
 
-say "environment variable names only (values redacted)"
-env | sed 's/=.*/=<redacted>/' | sort | head -60
+say "our own address and route"
+ip -4 addr 2>/dev/null | grep inet || hostname -I 2>/dev/null
+ip route 2>/dev/null | head -5
 
-say "network position"
-ip addr 2>&1 | grep -E 'inet |^[0-9]+:' | head -12
-cat /etc/resolv.conf 2>&1 | head -6
-echo "--- egress check to a public host:"
-curl -s -m 5 -o /dev/null -w '   example.com http=%{http_code}\n' https://example.com 2>&1 || true
+say "kernel log readable by an unprivileged build user?"
+if timeout 3 dd if=/dev/kmsg bs=1 count=1200 2>/dev/null | head -c 1200; then
+  echo; echo "   (kmsg WAS readable as uid $(id -u))"
+else
+  echo "   kmsg not readable"
+fi
 
-say "internal service reachability (connect only, nothing sent)"
-for hp in "169.254.169.254:80" "127.0.0.1:2375" "10.0.0.1:443"; do
-  h=${hp%:*}; p=${hp#*:}
-  timeout 3 bash -c "echo > /dev/tcp/$h/$p" 2>/dev/null && echo "   OPEN  $hp" || echo "   closed $hp"
-done
+say "does anything in this VM belong to someone else?"
+ls -la /opt/build 2>&1 | head -8
+ls -la /opt/buildhome 2>&1 | head -8
+echo "--- other home dirs:"; ls -la /home 2>&1 | head -8
 
 say "done"
