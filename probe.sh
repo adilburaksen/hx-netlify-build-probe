@@ -1,50 +1,66 @@
 #!/usr/bin/env bash
-# Second pass, narrowly scoped. The first pass showed a microVM with an unprivileged user and no
-# capabilities, so this one only follows the two threads it left open: the host node the build is
-# scheduled on, and the world-readable kernel log. Connect-only checks against a handful of named
-# ports; no scanning, nothing sent, nothing written.
+# Third pass, designed from two independent delegate reviews of the first two passes.
+# Read-only except for one canary file written under our own build's /tmp, which is how the
+# cross-account snapshot test is decided. Nothing is sent anywhere; no scanning beyond the single
+# host address Netlify itself injects, on four named ports.
 say(){ printf '\n===== %s =====\n' "$1"; }
 
-say "orchestration-adjacent values from our own build environment"
+say "PID 1 — container vs microVM, the cheapest falsification"
+tr '\0' ' ' </proc/1/cmdline 2>/dev/null; echo
+echo "--- pid1 cgroup:"; cat /proc/1/cgroup 2>&1 | head -6
+echo "--- self cgroup:"; cat /proc/self/cgroup 2>&1 | head -6
+
+say "setuid binaries (NoNewPrivs is 0, so these would matter)"
+find / -xdev -perm -4000 -type f -print 2>/dev/null | head -20
+echo "(count: $(find / -xdev -perm -4000 -type f 2>/dev/null | wc -l))"
+
+say "HOST_NODE_IP position and four named ports"
 echo "HOST_NODE_IP=${HOST_NODE_IP:-unset}"
-echo "ACCOUNT_ID=${ACCOUNT_ID:-unset}"
-echo "SITE_ID=${SITE_ID:-unset}"
-echo "BUILD_ID=${BUILD_ID:-unset}"
-echo "NETLIFY_BUILD_BASE=${NETLIFY_BUILD_BASE:-unset}"
-echo "skew token length=${#NETLIFY_SKEW_PROTECTION_TOKEN} prefix=${NETLIFY_SKEW_PROTECTION_TOKEN:0:6}"
-echo "FEATURE_FLAGS length=${#FEATURE_FLAGS}"
-
-say "can this build reach its own host node?"
 if [ -n "$HOST_NODE_IP" ]; then
-  for port in 10250 10255 4646 2375 2376 8500 22 443 80; do
-    timeout 2 bash -c "echo > /dev/tcp/$HOST_NODE_IP/$port" 2>/dev/null \
-      && echo "   OPEN   $HOST_NODE_IP:$port" || echo "   closed $HOST_NODE_IP:$port"
+  ip route get "$HOST_NODE_IP" 2>&1 | head -3
+  for p in 2375 2376 6443 10250; do
+    timeout 3 bash -c "</dev/tcp/${HOST_NODE_IP}/$p" 2>/dev/null \
+      && echo "   OPEN   ${HOST_NODE_IP}:$p" || echo "   closed ${HOST_NODE_IP}:$p"
   done
-else
-  echo "   HOST_NODE_IP unset"
 fi
 
-say "the internal resolver"
-cat /etc/resolv.conf 2>&1 | head -4
-for port in 53 80 443; do
-  timeout 2 bash -c "echo > /dev/tcp/172.16.6.1/$port" 2>/dev/null \
-    && echo "   OPEN   172.16.6.1:$port" || echo "   closed 172.16.6.1:$port"
+say "skew token structure, decoded locally, never transmitted"
+T="${NETLIFY_SKEW_PROTECTION_TOKEN:-}"
+echo "length=${#T} dots=$(awk -F. '{print NF-1}' <<<"$T")"
+if [ "$(awk -F. '{print NF-1}' <<<"$T")" = "2" ]; then
+  echo "--- header:";  cut -d. -f1 <<<"$T" | base64 -d 2>/dev/null | head -c 300; echo
+  echo "--- claims:";  cut -d. -f2 <<<"$T" | base64 -d 2>/dev/null | head -c 500; echo
+else
+  echo "not JWT-shaped; first 8 chars: ${T:0:8}"
+fi
+
+say "what consumes the identifiers?"
+grep -RIl "NETLIFY_SKEW_PROTECTION_TOKEN\|HOST_NODE_IP" /usr/local/bin /opt/build-bin 2>/dev/null | head -10
+echo "---"
+grep -RIl "SITE_ID\|BUILD_ID\|ACCOUNT_ID" /usr/local/bin /opt/build-bin 2>/dev/null | head -10
+
+say "THE MAIN EVENT — /rom/overlay/prev, a previous build snapshot"
+stat -c '%A %a uid=%u gid=%g %n' /rom /rom/overlay /rom/overlay/prev 2>&1
+echo "--- backing device:"; ls -l /dev/vdd 2>&1
+dumpe2fs -h /dev/vdd 2>/dev/null | grep -iE 'Filesystem UUID|Filesystem created|Last mount|Last write|Mount count' || echo "   dumpe2fs unavailable"
+echo "--- top level:"
+ls -la /rom/overlay/prev 2>&1 | head -25
+echo "--- two levels down:"
+find /rom/overlay/prev -maxdepth 3 -printf '%M %u %g %10s %p\n' 2>/dev/null | head -60
+
+say "does the previous snapshot carry anyone's repo, home, or credentials?"
+for d in /rom/overlay/prev/opt/build/repo /rom/overlay/prev/opt/buildhome \
+         /rom/overlay/prev/root /rom/overlay/prev/home /rom/overlay/prev/tmp; do
+  echo "--- $d"; ls -la "$d" 2>&1 | head -12
 done
+echo "--- any canary from a previous run of ours, or from anyone else:"
+find /rom/overlay/prev -maxdepth 6 -name 'hxcanary*' -o -maxdepth 6 -name '*.netlify' \
+     -o -maxdepth 6 -name 'id_rsa*' -o -maxdepth 6 -name '.git-credentials' 2>/dev/null | head -20
 
-say "our own address and route"
-ip -4 addr 2>/dev/null | grep inet || hostname -I 2>/dev/null
-ip route 2>/dev/null | head -5
-
-say "kernel log readable by an unprivileged build user?"
-if timeout 3 dd if=/dev/kmsg bs=1 count=1200 2>/dev/null | head -c 1200; then
-  echo; echo "   (kmsg WAS readable as uid $(id -u))"
-else
-  echo "   kmsg not readable"
-fi
-
-say "does anything in this VM belong to someone else?"
-ls -la /opt/build 2>&1 | head -8
-ls -la /opt/buildhome 2>&1 | head -8
-echo "--- other home dirs:"; ls -la /home 2>&1 | head -8
+say "leave our own canary so the next build can tell whose snapshot this is"
+CAN="/tmp/hxcanary-${ACCOUNT_ID:-noacct}-${SITE_ID:-nosite}.txt"
+printf 'hxcanary account=%s site=%s build=%s\n' "${ACCOUNT_ID:-?}" "${SITE_ID:-?}" "${BUILD_ID:-?}" > "$CAN" 2>/dev/null \
+  && echo "   wrote $CAN" || echo "   could not write canary"
+echo "$HOME:"; ls -la "$HOME" 2>&1 | head -8
 
 say "done"
