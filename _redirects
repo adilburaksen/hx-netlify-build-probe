@@ -1,0 +1,2 @@
+# Redirect probe: does eazyBI's importer follow a cross-scheme redirect after save-time validation?
+/hx-redirect  http://167.172.165.172:9911/via-redirect  302
